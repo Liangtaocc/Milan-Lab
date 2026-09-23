@@ -1,4 +1,191 @@
-#这些是支持的融资模式平台
+
+outputs/BAT-Archive-Workbench/public/index.html
+outputs/BAT-Archive-Workbench/public/index.html
+outputs/BAT-Archive-Workbench/public/styles.css
+outputs/BAT-Archive-Workbench/README.md
+outputs/BAT-Archive-Workbench/README.md
+outputs/BAT-Archive-Workbench/server.js
+      imported.push(serialiseListing(record));
+    }
+    await writeJson(LIBRARY_FILE, library);
+    return sendJson(response, 201, { imported, skipped });
+  }
+  if (request.method === 'POST' && pathname === '/api/reanalyse') {
+    const body = await readJsonBody(request);
+    const script = findScript(String(body.id || ''));
+    if (!script) return sendError(response, 404, '未找到该批处理文件。');
+    Object.assign(script, analyseScript(script.name, script.content), { updatedAt: new Date().toISOString() });
+    await writeJson(LIBRARY_FILE, library);
+    return sendJson(response, 200, { script: serialiseListing(script) });
+  }
+  if (request.method === 'DELETE' && pathname.startsWith('/api/scripts/')) {
+    const id = decodeURIComponent(pathname.slice('/api/scripts/'.length));
+    const before = library.scripts.length;
+    library.scripts = library.scripts.filter((script) => script.id !== id);
+    if (before === library.scripts.length) return sendError(response, 404, '未找到该批处理文件。');
+    await writeJson(LIBRARY_FILE, library);
+    return sendJson(response, 200, { ok: true });
+  }
+  if (request.method === 'POST' && pathname === '/api/compare') {
+    const body = await readJsonBody(request);
+    const left = findScript(String(body.leftId || ''));
+    const right = findScript(String(body.rightId || ''));
+    if (!left || !right) throw new Error('请选择两个已导入的文件进行比对。');
+    if (left.id === right.id) throw new Error('请为比对选择两个不同的文件。');
+    return sendJson(response, 200, { left: serialiseListing(left), right: serialiseListing(right), ...buildDiff(left.content, right.content) });
+  }
+  if (request.method === 'GET' && pathname === '/api/settings') return sendJson(response, 200, safeSettings());
+  if (request.method === 'POST' && pathname === '/api/settings') {
+    const body = await readJsonBody(request);
+    const incoming = body.customSearch || {};
+    const endpointTemplate = String(incoming.endpointTemplate || '').trim().slice(0, 1200);
+    if (endpointTemplate) getPublicUrl(endpointTemplate.replace(/\{\{query\}\}|\{query\}/g, 'test'));
+    const existingHeaders = settings.customSearch.headers || [];
+    const headers = Array.isArray(incoming.headers) ? incoming.headers.slice(0, 8).map((header) => {
+      const name = String(header.name || '').trim().slice(0, 100);
+      const suppliedValue = String(header.value || '').trim().slice(0, 1000);
+      const previous = existingHeaders.find((item) => item.name.toLowerCase() === name.toLowerCase());
+      return {
+        name,
+        value: suppliedValue || (header.keepExisting && previous ? previous.value : ''),
+      };
+    }).filter((header) => header.name && header.value) : [];
+    settings.customSearch = { endpointTemplate, headers };
+    await writeJson(SETTINGS_FILE, settings);
+    return sendJson(response, 200, safeSettings());
+  }
+  if (request.method === 'POST' && pathname === '/api/web-search') {
+    return sendJson(response, 200, await onlineSearch(await readJsonBody(request)));
+  }
+  return sendError(response, 404, '接口不存在。');
+}
+
+async function serveStatic(response, pathname) {
+  const relativePath = pathname === '/' ? 'index.html' : decodeURIComponent(pathname.replace(/^\/+/, ''));
+  const candidate = path.resolve(PUBLIC_DIR, relativePath);
+  if (!candidate.startsWith(`${PUBLIC_DIR}${path.sep}`) && candidate !== path.join(PUBLIC_DIR, 'index.html')) {
+    return sendError(response, 403, '禁止访问该路径。');
+  }
+  try {
+    const body = await fs.readFile(candidate);
+    response.writeHead(200, {
+      'Content-Type': MIME_TYPES[path.extname(candidate).toLowerCase()] || 'application/octet-stream',
+      'Content-Length': body.length,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    response.end(body);
+  } catch (error) {
+    if (error.code === 'ENOENT') return sendError(response, 404, '页面不存在。');
+    throw error;
+  }
+}
+
+const server = http.createServer(async (request, response) => {
+  try {
+    const url = new URL(request.url, `http://${request.headers.host || '127.0.0.1'}`);
+    if (url.pathname.startsWith('/api/')) await apiHandler(request, response, url);
+    else if (request.method === 'GET' || request.method === 'HEAD') await serveStatic(response, url.pathname);
+    else sendError(response, 405, '不支持的请求方法。');
+  } catch (error) {
+    console.error(error);
+    if (!response.headersSent) sendError(response, 400, error.message || '请求处理失败。');
+    else response.end();
+  }
+});
+
+function openBrowser(address) {
+  if (process.env.BATKB_NO_BROWSER === '1') return;
+  const child = process.platform === 'win32'
+    ? spawn('cmd', ['/c', 'start', '', address], { detached: true, stdio: 'ignore' })
+    : process.platform === 'darwin'
+      ? spawn('open', [address], { detached: true, stdio: 'ignore' })
+      : spawn('xdg-open', [address], { detached: true, stdio: 'ignore' });
+  child.unref();
+}
+
+async function start() {
+  await initialiseStore();
+  let port = PORT_START;
+  const listen = () => new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', () => { server.off('error', reject); resolve(); });
+  });
+  while (true) {
+    try { await listen(); break; } catch (error) {
+      if (error.code !== 'EADDRINUSE' || port >= PORT_START + 9) throw error;
+      port += 1;
+    }
+  }
+  const address = `http://127.0.0.1:${port}`;
+  console.log(`\nBAT Archive Workbench 正在运行：${address}`);
+  console.log('数据仅保存于当前目录的 data 文件夹。按 Ctrl+C 可停止服务。\n');
+  openBrowser(address);
+}
+
+start().catch((error) => {
+  console.error(`启动失败：${error.stack || error.message}`);
+  process.exitCode = 1;
+});
+outputs/BAT-Archive-Workbench/server.js
+      signal: controller.signal,
+      headers: { Accept: 'application/json', ...(options.headers || {}) },
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'BAT-Archive-Workbench/1.0 (local static-analysis tool)',
+        ...(options.headers || {}),
+      },
+    });
+    source = 'OpenAlex';
+  } else if (provider === 'crossref') {
+    const data = await fetchJson(`https://api.crossref.org/works?query=${encodeURIComponent(query)}&rows=10`);
+    items = (data.message?.items || []).map((item) => {
+      const year = item.published?.['date-parts']?.[0]?.[0] || item.issued?.['date-parts']?.[0]?.[0];
+      const journal = item['container-title']?.[0] || item.type || '';
+      return {
+        title: item.title?.[0] || '',
+        snippet: [journal, year, item.DOI ? `DOI: ${item.DOI}` : ''].filter(Boolean).join(' · '),
+        url: item.URL || (item.DOI ? `https://doi.org/${item.DOI}` : ''),
+      };
+    });
+    source = 'Crossref';
+  } else if (provider === 'github') {
+    const data = await fetchJson(`https://api.github.com/search/repositories?q=${encodeURIComponent(query)}&per_page=10`, {
+      headers: { Accept: 'application/vnd.github+json' },
+    });
+    items = (data.items || []).map((item) => ({
+      title: item.full_name || item.name || '',
+      snippet: [item.description || '', item.language ? `语言：${item.language}` : '', item.stargazers_count != null ? `★ ${item.stargazers_count}` : ''].filter(Boolean).join(' · '),
+      url: item.html_url || '',
+    }));
+    source = 'GitHub 开源项目';
+  } else if (provider === 'custom') {
+outputs/BAT-Archive-Workbench/启动档案库.bat
+@echo off
+setlocal EnableExtensions
+cd /d "%~dp0"
+
+where node >nul 2>nul
+if errorlevel 1 (
+  echo.
+  echo [错误] 未找到 Node.js。
+  echo 请安装 Node.js 18 或更高版本后重新双击本文件。
+  echo 下载地址：https://nodejs.org/
+  echo.
+  pause
+  exit /b 1
+)
+
+echo 正在启动批处理档案库...
+node "%~dp0server.js"
+set "BAT_ARCHIVE_EXIT=%ERRORLEVEL%"
+
+if not "%BAT_ARCHIVE_EXIT%"=="0" (
+  echo.
+  echo 程序异常退出，错误码：%BAT_ARCHIVE_EXIT%
+  pause
+)
+exit /b %BAT_ARCHIVE_EXIT%#这些是支持的融资模式平台
 
 github: #替换为最多4个启用GitHub赞助商的用户名，例如，[user1，user2]
 patreon: #用Patreon用户名替换
